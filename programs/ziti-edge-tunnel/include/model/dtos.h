@@ -28,8 +28,8 @@ XX(ZtAPI, string, none, ZtAPI, __VA_ARGS__) \
 XX(ConfigTypes, string, array, ConfigTypes, __VA_ARGS__)
 
 #define TUNNEL_METRICS(XX, ...) \
-XX(Up, string, none, Up, __VA_ARGS__) \
-XX(Down, string, none, Down, __VA_ARGS__)
+XX(Up, int, none, Up, __VA_ARGS__) \
+XX(Down, int, none, Down, __VA_ARGS__)
 
 #define TUNNEL_IDENTITY(XX, ...) \
 XX(Name, string, none, Name, __VA_ARGS__) \
@@ -42,15 +42,18 @@ XX(Status, string, none, Status, __VA_ARGS__) \
 XX(MfaEnabled, bool, none, MfaEnabled, __VA_ARGS__) \
 XX(MfaNeeded, bool, none, MfaNeeded, __VA_ARGS__) \
 XX(Services, tunnel_service, array, Services, __VA_ARGS__) \
-XX(Metrics, tunnel_metrics, none, Metrics, __VA_ARGS__) \
+XX(Metrics, tunnel_metrics, ptr, Metrics, __VA_ARGS__) \
 XX(Tags, string, array, Tags, __VA_ARGS__) \
 XX(MfaMinTimeout, int, none, MfaMinTimeout, __VA_ARGS__) \
 XX(MfaMaxTimeout, int, none, MfaMaxTimeout, __VA_ARGS__) \
 XX(MfaMinTimeoutRem, int, none, MfaMinTimeoutRem, __VA_ARGS__) \
 XX(MfaMaxTimeoutRem, int, none, MfaMaxTimeoutRem, __VA_ARGS__) \
+XX(MinTimeoutRemInSvcEvent, int, none, MinTimeoutRemInSvcEvent, __VA_ARGS__) \
+XX(MaxTimeoutRemInSvcEvent, int, none, MaxTimeoutRemInSvcEvent, __VA_ARGS__) \
 XX(MfaLastUpdatedTime, timestamp, ptr, MfaLastUpdatedTime, __VA_ARGS__) \
 XX(ServiceUpdatedTime, timestamp, ptr, ServiceUpdatedTime, __VA_ARGS__) \
-XX(Deleted, bool, none, Deleted, __VA_ARGS__)
+XX(Deleted, bool, none, Deleted, __VA_ARGS__) \
+XX(Notified, bool, none, Notified, __VA_ARGS__)
 
 #define TUNNEL_ADDRESS(XX, ...) \
 XX(IsHost, bool, none, IsHost, __VA_ARGS__) \
@@ -81,6 +84,12 @@ XX(IsAccessable, bool, none, IsAccessable, __VA_ARGS__) \
 XX(Timeout, int, none, Timeout, __VA_ARGS__)         \
 XX(TimeoutRemaining, int, none, TimeoutRemaining, __VA_ARGS__)
 
+#define TUNNEL_STATUS(XX, ...) \
+XX(Active, bool, none, Active, __VA_ARGS__) \
+XX(Duration, int, none, Duration, __VA_ARGS__) \
+XX(StartTime, timestamp, none,StartTime, __VA_ARGS__) \
+XX(Identities, tunnel_identity, array, Identities, __VA_ARGS__)
+
 DECLARE_MODEL(tunnel_config, TUNNEL_CONFIG)
 DECLARE_MODEL(tunnel_metrics, TUNNEL_METRICS)
 DECLARE_MODEL(tunnel_address, TUNNEL_ADDRESS)
@@ -88,6 +97,7 @@ DECLARE_MODEL(tunnel_port_range, TUNNEL_PORT_RANGE)
 DECLARE_MODEL(tunnel_posture_check, TUNNEL_POSTURE_CHECK)
 DECLARE_MODEL(tunnel_service, TUNNEL_SERVICE)
 DECLARE_MODEL(tunnel_identity, TUNNEL_IDENTITY)
+DECLARE_MODEL(tunnel_status, TUNNEL_STATUS)
 
 #ifdef __cplusplus
 }

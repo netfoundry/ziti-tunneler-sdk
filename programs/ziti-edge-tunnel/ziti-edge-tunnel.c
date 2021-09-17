@@ -24,14 +24,16 @@
 #define setenv(n,v,o) do {if(o || getenv(n) == NULL) _putenv_s(n,v); } while(0)
 #endif
 
-
+#ifndef MAXMESSAGELEN
+#define MAXMESSAGELEN 4096
+#endif
 
 extern dns_manager *get_dnsmasq_manager(const char* path);
 
 static int dns_fallback(const char *name, void *ctx, struct in_addr* addr);
 
 static void send_message_to_tunnel();
-static void send_events_message(void *message, size_t datalen);
+static void send_events_message(void *message, size_t datalen, bool display_event);
 
 struct cfg_instance_s {
     char *cfg;
@@ -42,6 +44,8 @@ struct cfg_instance_s {
 static LIST_HEAD(instance_list, cfg_instance_s) load_list;
 
 static long refresh_interval = 10;
+static long refresh_metrics = 5000;
+static long metrics_latency = 5000;
 
 static char *config_dir = NULL;
 
@@ -49,6 +53,9 @@ static uv_pipe_t cmd_server;
 static uv_pipe_t cmd_conn;
 static uv_pipe_t event_server;
 static uv_pipe_t *event_conn;
+
+//timer
+static uv_timer_t metrics_timer;
 
 // singleton
 static const ziti_tunnel_ctrl *CMD_CTRL;
@@ -184,6 +191,16 @@ static void on_events_client(uv_stream_t *s, int status) {
         uv_pipe_init(s->loop, event_conn, 0);
         uv_accept(s, (uv_stream_t *) event_conn);
         ZITI_LOG(DEBUG,"Received events connection request %d", ++current_events_channels);
+
+        // send status message immediately
+        tunnel_status_event tnl_sts_evt = {0};
+        tnl_sts_evt.Op = strdup("status");
+        tnl_sts_evt.Status = get_tunnel_status();
+        size_t json_len;
+        char *json = tunnel_status_event_to_json(&tnl_sts_evt, MODEL_JSON_COMPACT, &json_len);
+        send_events_message(json, json_len, true);
+        tnl_sts_evt.Status = NULL;
+        free_tunnel_status_event(&tnl_sts_evt);
     } else {
         ZITI_LOG(WARN, "Maximum events connection requests exceeded");
     }
@@ -202,8 +219,10 @@ void on_write_event(uv_write_t* req, int status) {
     free(req);
 }
 
-static void send_events_message(void *message, size_t data_len) {
-    ZITI_LOG(INFO,"Events Message...%s", message);
+static void send_events_message(void *message, size_t data_len, bool display_event) {
+    if (display_event) {
+        ZITI_LOG(TRACE,"Events Message...%s", message);
+    }
     if (event_conn != NULL) {
         uv_buf_t buf = uv_buf_init(message, data_len);
         uv_write_t *wr = calloc(1, sizeof(uv_write_t));
@@ -256,6 +275,153 @@ static int start_event_socket(uv_loop_t *l) {
     return -1;
 }
 
+static void tnl_transfer_rates_cb(const tunnel_identity_metrics *metrics, void *ctx) {
+    tunnel_identity *tnl_id = ctx;
+    tnl_id->Metrics = calloc(1, sizeof(struct tunnel_metrics_s));
+    tnl_id->Metrics->Up = (int) strtol(metrics->up, NULL, 10);
+    tnl_id->Metrics->Down = (int) strtol(metrics->down, NULL, 10);
+}
+
+
+static char* addUnit(int count, char* unit) {
+    char* result = malloc(MAXMESSAGELEN);
+
+    if ((count == 1) || (count == 0)) {
+        snprintf(result, MAXMESSAGELEN, "%d %s", count, unit);
+    } else {
+        snprintf(result, MAXMESSAGELEN, "%d %ss", count, unit);
+    }
+    return result;
+}
+
+static string convert_seconds_to_readable_format(int input) {
+    int seconds = input % (60 * 60 * 24);
+    int hours = ((double) seconds / 60 / 60);
+    seconds = input % (60 * 60);
+    int minutes = ((double) seconds)/ 60;
+    seconds = input % 60;
+    char* result = malloc(MAXMESSAGELEN);
+
+    if (hours > 0) {
+        snprintf(result, MAXMESSAGELEN, "%s %s %s", addUnit(hours, "hour"), addUnit(minutes, "minute"), addUnit(seconds, "second"));
+    } else if (minutes > 0) {
+        snprintf(result, MAXMESSAGELEN, "%s %s", addUnit(minutes, "minute"), addUnit(seconds, "second"));
+    } else {
+        snprintf(result, MAXMESSAGELEN, "%s", addUnit(seconds, "second"));
+    }
+
+    return result;
+}
+
+static bool check_send_notification(tunnel_identity *tnl_id) {
+    if (!tnl_id->MfaEnabled || tnl_id->MfaMinTimeout <= 0 || tnl_id->MinTimeoutRemInSvcEvent <=0) {
+        return false;
+    }
+    if (tnl_id->MfaMinTimeoutRem > 0) {
+        tnl_id->MfaMinTimeoutRem = get_remaining_timeout(tnl_id->MfaMinTimeout, tnl_id->MinTimeoutRemInSvcEvent, tnl_id);
+    }
+    if (tnl_id->MfaMaxTimeoutRem > 0) {
+        tnl_id->MfaMaxTimeoutRem = get_remaining_timeout(tnl_id->MfaMaxTimeout, tnl_id->MaxTimeoutRemInSvcEvent, tnl_id);
+    }
+
+    if (tnl_id->Notified) {
+        // No need to send notification again
+        return false;
+    }
+
+    if (tnl_id->MfaMinTimeoutRem > 20 * 60) {
+        // No services are nearing timeout
+        return false;
+    } else {
+        return true;
+    }
+}
+
+static notification_message *create_notification_message(tunnel_identity *tnl_id) {
+    notification_message *notification = calloc(1, sizeof(struct notification_message_s));
+    notification->Message = malloc(MAXMESSAGELEN);
+    if (tnl_id->MfaMaxTimeoutRem == 0) {
+        snprintf(notification->Message, MAXMESSAGELEN, "All of the services of identity %s have timed out", tnl_id->Name);
+    } else if (tnl_id->MfaMinTimeoutRem == 0) {
+        snprintf(notification->Message, MAXMESSAGELEN, "Some of the services of identity %s have timed out", tnl_id->Name);
+    } else if (tnl_id->MfaMinTimeoutRem <= 20*60) {
+        snprintf(notification->Message, MAXMESSAGELEN, "Some of the services of identity %s are timing out in %s", tnl_id->Name, convert_seconds_to_readable_format(tnl_id->MfaMinTimeoutRem));
+    } else {
+        // do nothing
+    }
+
+    notification->IdentityName = strdup(tnl_id->Name);
+    notification->Identifier = strdup(tnl_id->Identifier);
+    notification->Severity = strdup("major");
+    uv_timeval64_t now;
+    uv_gettimeofday(&now);
+    notification->MfaTimeDuration = now.tv_sec - tnl_id->MfaLastUpdatedTime->tv_sec;
+    notification->MfaMinimumTimeout = tnl_id->MfaMinTimeoutRem;
+    notification->MfaMaximumTimeout = tnl_id->MfaMaxTimeoutRem;
+
+    return notification;
+}
+
+static void broadcast_metrics(uv_timer_t *timer) {
+    tunnel_metrics_event metrics_event = {0};
+    metrics_event.Op = strdup("metrics");
+    metrics_event.Identities = get_tunnel_identities();
+    tunnel_identity *tnl_id;
+    int idx;
+    bool active_identities = false;
+    if (metrics_event.Identities != NULL) {
+        model_map notification_map = {0};
+        for(idx = 0; metrics_event.Identities[idx]; idx++) {
+            tnl_id = metrics_event.Identities[idx];
+            if (tnl_id->Active && tnl_id->Loaded) {
+                active_identities = true;
+                CMD_CTRL->get_transfer_rates(tnl_id->Identifier, NULL, tnl_transfer_rates_cb, tnl_id);
+
+                // check timeout
+                if (check_send_notification(tnl_id)) {
+                    notification_message *message = create_notification_message(tnl_id);
+                    model_map_set(&notification_map, tnl_id->Name, message);
+                    tnl_id->Notified = true;
+                }
+
+            }
+        }
+        if (model_map_size(&notification_map) > 0) {
+            notification_event event = {0};
+            event.Op = strdup("notification");
+            notification_message_array notification_messages = calloc(model_map_size(&notification_map) + 1, sizeof(struct notification_message_s));
+            int notification_idx = 0;
+            const char* key;
+            notification_message *message;
+            MODEL_MAP_FOREACH(key, message, &notification_map) {
+                notification_messages[notification_idx++] = message;
+            }
+            event.Notification = notification_messages;
+
+            size_t json_len;
+            char *json = notification_event_to_json(&event, MODEL_JSON_COMPACT, &json_len);
+            send_events_message(json, json_len, true);
+            event.Notification = NULL;
+            free_notification_event(&event);
+            model_map_clear(&notification_map, (_free_f) free_notification_message);
+        }
+    }
+
+    if (active_identities)
+    {
+        size_t json_len;
+        char *json = tunnel_metrics_event_to_json(&metrics_event, MODEL_JSON_COMPACT, &json_len);
+        send_events_message(json, json_len, false);
+    }
+    metrics_event.Identities = NULL;
+    free_tunnel_metrics_event(&metrics_event);
+}
+
+static void start_metrics_timer(uv_loop_t *ziti_loop) {
+    uv_timer_init(ziti_loop, &metrics_timer);
+    uv_timer_start(&metrics_timer, broadcast_metrics, metrics_latency, refresh_metrics);
+}
+
 static void load_identities(uv_work_t *wr) {
     if (config_dir != NULL) {
         uv_fs_t fs;
@@ -296,6 +462,7 @@ static void load_identities_complete(uv_work_t * wr, int status) {
         LIST_REMOVE(inst, _next);
 
         CMD_CTRL->load_identity(NULL, inst->cfg, load_id_cb, inst);
+        start_metrics_timer(wr->loop);
     }
 }
 
@@ -309,9 +476,10 @@ static void on_event(const base_event *ev) {
             id_event.Op = strdup("identity");
             id_event.Action = strdup(event_name(event_added));
             id_event.Id = get_tunnel_identity(ev->identifier);
+            id_event.Id->Loaded = true;
 
             if (zev->code == ZITI_OK) {
-                id_event.Id->Loaded = true;
+                id_event.Id->Active = true; // determine it from controller
                 if (zev->name) {
                     id_event.Id->Name = strdup(zev->name);
                     id_event.Id->ControllerVersion = strdup(zev->version);
@@ -322,7 +490,7 @@ static void on_event(const base_event *ev) {
 
             size_t json_len;
             char *json = identity_event_to_json(&id_event, MODEL_JSON_COMPACT, &json_len);
-            send_events_message(json, json_len);
+            send_events_message(json, json_len, true);
             id_event.Id = NULL;
             free_identity_event(&id_event);
 
@@ -342,16 +510,19 @@ static void on_event(const base_event *ev) {
             ziti_service **zs;
             int idx = 0;
             if (svc_ev->removed_services != NULL) {
-                svc_event.RemovedServices = calloc(sizeof(svc_ev->added_services) + 1, sizeof(tunnel_service *));
+                svc_event.RemovedServices = calloc(sizeof(svc_ev->removed_services), sizeof(struct tunnel_service_s));
                 for (zs = svc_ev->removed_services; *zs != NULL; zs++) {
-                    tunnel_service *svc = get_tunnel_service(id, *zs);
+                    tunnel_service *svc = find_tunnel_service(id, (*zs)->id);
+                    if (svc == NULL) {
+                        svc = get_tunnel_service(id, *zs);
+                    }
                     svc_event.RemovedServices[idx++] = svc;
                 }
             }
 
             idx = 0;
             if (svc_ev->added_services != NULL) {
-                svc_event.AddedServices = calloc(sizeof(svc_ev->added_services) + 1, sizeof(tunnel_service *));
+                svc_event.AddedServices = calloc(sizeof(svc_ev->added_services), sizeof(struct tunnel_service_s));
                 for (zs = svc_ev->added_services; *zs != NULL; zs++) {
                     tunnel_service *svc = get_tunnel_service(id, *zs);
                     svc_event.AddedServices[idx++] = svc;
@@ -364,7 +535,7 @@ static void on_event(const base_event *ev) {
 
             size_t json_len;
             char *json = services_event_to_json(&svc_event, MODEL_JSON_COMPACT, &json_len);
-            send_events_message(json, json_len);
+            send_events_message(json, json_len, true);
             if (svc_event.AddedServices != NULL) {
                 svc_event.AddedServices = NULL;
             }
@@ -385,7 +556,7 @@ static void on_event(const base_event *ev) {
 
             size_t json_len;
             char *json = identity_event_to_json(&id_event, MODEL_JSON_COMPACT, &json_len);
-            send_events_message(json, json_len);
+            send_events_message(json, json_len, true);
             id_event.Id = NULL;
             free_identity_event(&id_event);
             break;
@@ -402,9 +573,23 @@ static void on_event(const base_event *ev) {
             };
 
             if (mfa_ev->code == ZITI_OK) {
-                // check for auth success
-                set_mfa_status(ev->identifier, true, false);
-                update_mfa_time(ev->identifier);
+                switch (mfa_ev->operation_type) {
+                    case mfa_status_mfa_auth_status:
+                    case mfa_status_enrollment_verification:
+                        set_mfa_status(ev->identifier, true, false);
+                        update_mfa_time(ev->identifier);
+                        break;
+                    case mfa_status_enrollment_remove:
+                        set_mfa_status(ev->identifier, false, false);
+                        break;
+                    case mfa_status_enrollment_challenge:
+                        mfa_sts_event.RecoveryCodes = mfa_ev->recovery_codes;
+                        mfa_sts_event.ProvisioningUrl = strdup(mfa_ev->provisioning_url);
+                        break;
+                    default:
+                        ZITI_LOG(WARN, "ztx[%s] MFA unknown status : %d", ev->identifier, mfa_ev->operation_type);
+                }
+
                 mfa_sts_event.Successful = true;
             } else {
                 mfa_sts_event.Successful = false;
@@ -413,8 +598,11 @@ static void on_event(const base_event *ev) {
 
             size_t json_len;
             char *json = mfa_status_event_to_json(&mfa_sts_event, MODEL_JSON_COMPACT, &json_len);
-            send_events_message(json, json_len);
+            send_events_message(json, json_len, true);
+            
+            mfa_sts_event.RecoveryCodes = NULL;
             free_mfa_status_event(&mfa_sts_event);
+            // free_mfa_event(mfa_ev);
             break;
         }
 
@@ -455,6 +643,10 @@ static int run_tunnel(uv_loop_t *ziti_loop, uint32_t tun_ip, uint32_t dns_ip, co
 
     tunneler_context tunneler = ziti_tunneler_init(&tunneler_opts, ziti_loop);
 
+    // generate tunnel status instance and save active state and start time
+    tunnel_status *tnl_status = get_tunnel_status();
+    tnl_status->Active = true;
+
     ziti_dns_setup(tunneler, ip4addr_ntoa(&dns_ip), ip_range);
     ziti_dns_set_fallback(ziti_loop, dns_fallback, NULL);
 
@@ -474,6 +666,7 @@ static int run_tunnel(uv_loop_t *ziti_loop, uint32_t tun_ip, uint32_t dns_ip, co
     free(tunneler);
     uv_close((uv_handle_t *) &cmd_server, (uv_close_cb) free);
     uv_close((uv_handle_t *) &event_server, (uv_close_cb) free);
+    uv_timer_stop(&metrics_timer);
     return 0;
 }
 
@@ -1250,3 +1443,6 @@ IMPL_MODEL(identity_event, IDENTITY_EVENT)
 IMPL_MODEL(services_event, SERVICES_EVENT)
 IMPL_MODEL(tunnel_status_event, TUNNEL_STATUS_EVENT)
 IMPL_MODEL(mfa_status_event, MFA_STATUS_EVENT)
+IMPL_MODEL(tunnel_metrics_event, TUNNEL_METRICS_EVENT)
+IMPL_MODEL(notification_message, TUNNEL_NOTIFICATION_MESSAGE)
+IMPL_MODEL(notification_event, TUNNEL_NOTIFICATION_EVENT)

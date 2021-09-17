@@ -28,6 +28,7 @@ struct tnl_identity_s {
 static LIST_HEAD(tnl_identities, tnl_identity_s) tnl_identity_list = LIST_HEAD_INITIALIZER(&tnl_identity_list);
 static const char* CFG_INTERCEPT_V1 = "intercept.v1";
 static const char* CFG_ZITI_TUNNELER_CLIENT_V1 = "ziti-tunneler-client.v1";
+tunnel_status *tnl_status;
 
 tunnel_identity *find_tunnel_identity(char* identifier) {
     struct tnl_identity_s *tnl_id;
@@ -57,6 +58,56 @@ tunnel_identity *get_tunnel_identity(char* identifier) {
     }
 }
 
+void set_mfa_timeout(tunnel_identity *tnl_id) {
+    if (tnl_id->Services != NULL) {
+        int mfa_min_timeout = -1;
+        int mfa_min_timeout_rem = -1;
+        int mfa_max_timeout = -1;
+        int mfa_max_timeout_rem = -1;
+        bool no_timeout_svc = false;
+        bool no_timeout_svc_rem = false;
+        for (int svc_idx = 0; tnl_id->Services[svc_idx] != 0; svc_idx++) {
+            tunnel_service *tnl_svc = tnl_id->Services[svc_idx];
+
+            if (tnl_svc->Timeout > -1) {
+                if (mfa_min_timeout == -1 || mfa_min_timeout > tnl_svc->Timeout) {
+                    mfa_min_timeout = tnl_svc->Timeout;
+                }
+                if (mfa_max_timeout == -1 || mfa_max_timeout < tnl_svc->Timeout) {
+                    mfa_max_timeout = tnl_svc->Timeout;
+                }
+            } else {
+                no_timeout_svc = true;
+            }
+            if (tnl_svc->TimeoutRemaining > -1) {
+                if (mfa_min_timeout_rem == -1 || mfa_min_timeout_rem > tnl_svc->TimeoutRemaining) {
+                    mfa_min_timeout_rem = tnl_svc->TimeoutRemaining;
+                }
+                if (mfa_max_timeout_rem == -1 || mfa_max_timeout_rem < tnl_svc->TimeoutRemaining) {
+                    mfa_max_timeout_rem = tnl_svc->TimeoutRemaining;
+                }
+            } else {
+                no_timeout_svc_rem = true;
+            }
+
+        }
+        if (no_timeout_svc) {
+            mfa_max_timeout = -1;
+        }
+        if (no_timeout_svc_rem) {
+            mfa_max_timeout_rem = -1;
+        }
+
+        tnl_id->MfaMaxTimeout = mfa_max_timeout;
+        tnl_id->MfaMaxTimeoutRem = mfa_max_timeout_rem;
+        tnl_id->MaxTimeoutRemInSvcEvent = mfa_max_timeout_rem;
+        tnl_id->MfaMinTimeout = mfa_min_timeout;
+        tnl_id->MfaMinTimeoutRem = mfa_min_timeout_rem;
+        tnl_id->MinTimeoutRemInSvcEvent = mfa_min_timeout_rem;
+    }
+
+}
+
 void add_or_remove_services_from_tunnel(tunnel_identity *id, tunnel_service_array added_services, tunnel_service_array removed_services) {
 
     model_map updates = {0};
@@ -77,8 +128,6 @@ void add_or_remove_services_from_tunnel(tunnel_identity *id, tunnel_service_arra
             tunnel_service *rem_svc = model_map_get(&updates, svc->Name);
             if (rem_svc != NULL) {
                 model_map_remove(&updates, rem_svc->Name);
-                free_tunnel_service(rem_svc);
-                free(rem_svc);
             }
         }
     }
@@ -93,10 +142,10 @@ void add_or_remove_services_from_tunnel(tunnel_identity *id, tunnel_service_arra
 
     // reallocate when new event comes, we need to maintain the whole list of services in tunnel_identity
     if (id->Services == NULL) {
-        id->Services = calloc(model_map_size(&updates), sizeof(struct tunnel_service_s));
+        id->Services = calloc(model_map_size(&updates) + 1, sizeof(struct tunnel_service_s));
     } else {
         free(id->Services);
-        id->Services = calloc(model_map_size(&updates), sizeof(struct tunnel_service_s));
+        id->Services = calloc(model_map_size(&updates) + 1, sizeof(struct tunnel_service_s));
     }
     model_map_iter it = model_map_iterator(&updates);
     idx=0;
@@ -104,7 +153,14 @@ void add_or_remove_services_from_tunnel(tunnel_identity *id, tunnel_service_arra
         id->Services[idx++] = model_map_it_value(it);
         it = model_map_it_next(it);
     };
-
+    set_mfa_timeout(id);
+    uv_timeval64_t now;
+    uv_gettimeofday(&now);
+    if (id->ServiceUpdatedTime == NULL) {
+        id->ServiceUpdatedTime = malloc(sizeof(timestamp));
+    }
+    id->ServiceUpdatedTime->tv_sec = now.tv_sec;
+    id->ServiceUpdatedTime->tv_usec = now.tv_usec;
 }
 
 static tunnel_posture_check *getTunnelPostureCheck(ziti_posture_query *pq){
@@ -118,52 +174,48 @@ static tunnel_posture_check *getTunnelPostureCheck(ziti_posture_query *pq){
 }
 
 static void setTunnelPostureDataTimeout(tunnel_service *tnl_svc, ziti_service *service) {
-    int posture_set_idx;
     int minTimeoutRemaining = -1;
     int minTimeout = -1;
     bool hasAccess = false;
     model_map postureCheckMap = {0};
 
-    if (service->posture_query_set != NULL) {
+    ziti_posture_query_set *pqs;
+    const char *key;
+    MODEL_MAP_FOREACH(key, pqs, &service->posture_query_map) {
 
-        for (posture_set_idx = 0; service->posture_query_set[posture_set_idx] != 0; posture_set_idx++) {
-            int posture_query_idx;
+        if (pqs->policy_type == "Bind") {
+            ZITI_LOG(TRACE, "Posture Query set returned a Bind policy: %s [ignored]", pqs->policy_id);
+            continue;
+        } else {
+            ZITI_LOG(TRACE, "Posture Query set returned a %s policy: %s, is_passing %d", pqs->policy_type, pqs->policy_id, pqs->is_passing);
+        }
 
-            ziti_posture_query_set *pqs = service->posture_query_set[posture_set_idx];
-            if (pqs->policy_type == "Bind") {
-                ZITI_LOG(TRACE, "Posture Query set returned a Bind policy: %s [ignored]", pqs->policy_id);
-                continue;
-            } else {
-                ZITI_LOG(TRACE, "Posture Query set returned a %s policy: %s, is_passing %d", pqs->policy_type, pqs->policy_id, pqs->is_passing);
+        if (pqs->is_passing) {
+            hasAccess = true;
+        }
+
+        for (int posture_query_idx = 0; pqs->posture_queries[posture_query_idx]; posture_query_idx++) {
+            ziti_posture_query *pq = pqs->posture_queries[posture_query_idx];
+            ziti_posture_query *tmp = model_map_get(&postureCheckMap, pq->id);
+            if (tmp == NULL) {
+                model_map_set(&postureCheckMap, pq->id, pq);
             }
 
-            if (pqs->is_passing) {
-                hasAccess = true;
+            int timeoutRemaining = *pqs->posture_queries[posture_query_idx]->timeoutRemaining;
+            if ((minTimeoutRemaining == -1) || (timeoutRemaining < minTimeoutRemaining)) {
+                minTimeoutRemaining = timeoutRemaining;
             }
 
-            for (posture_query_idx = 0; service->posture_query_set[posture_set_idx]->posture_queries[posture_query_idx]; posture_query_idx++) {
-                ziti_posture_query *pq = service->posture_query_set[posture_set_idx]->posture_queries[posture_query_idx];
-                ziti_posture_query *tmp = model_map_get(&postureCheckMap, pq->id);
-                if (tmp == NULL) {
-                    model_map_set(&postureCheckMap, pq->id, pq);
-                }
-
-                int timeoutRemaining = *service->posture_query_set[posture_set_idx]->posture_queries[posture_query_idx]->timeoutRemaining;
-                if ((minTimeoutRemaining == -1) || (timeoutRemaining < minTimeoutRemaining)) {
-                    minTimeoutRemaining = timeoutRemaining;
-                }
-
-                int timeout = service->posture_query_set[posture_set_idx]->posture_queries[posture_query_idx]->timeout;
-                if ((minTimeout == -1) || (timeout < minTimeout)) {
-                    minTimeout = timeout;
-                }
+            int timeout = pqs->posture_queries[posture_query_idx]->timeout;
+            if ((minTimeout == -1) || (timeout < minTimeout)) {
+                minTimeout = timeout;
             }
         }
     }
 
     if (model_map_size(&postureCheckMap) > 0) {
         int idx = 0;
-        tnl_svc->PostureChecks = calloc(model_map_size(&postureCheckMap), sizeof(struct tunnel_posture_check_s));
+        tnl_svc->PostureChecks = calloc(model_map_size(&postureCheckMap) + 1, sizeof(struct tunnel_posture_check_s));
         model_map_iter itr = model_map_iterator(&postureCheckMap);
         while (itr != NULL){
             ziti_posture_query *pq = model_map_it_value(itr);
@@ -185,7 +237,7 @@ static tunnel_address *to_address(string hostOrIPOrCIDR) {
     tnl_address->Prefix = 0;
 
     char* ip = {0};
-    uv_inet_pton(AF_INET, strdup(hostOrIPOrCIDR), ip);
+    int res = uv_inet_pton(AF_INET, strdup(hostOrIPOrCIDR), ip);
     if (ip != NULL) {
         tnl_address->IP = ip;
         tnl_address->HostName = NULL;
@@ -209,30 +261,31 @@ tunnel_port_range *getTunnelPortRange(ziti_port_range *zpr){
 
 static void setTunnelServiceAddress(tunnel_service *tnl_svc, ziti_service *service) {
     const char* intercept_v1_config = ziti_service_get_raw_config(service, CFG_INTERCEPT_V1);
-    tunnel_address_array *tnl_addr_arr;
-    string_array protocols = {0};
-    tunnel_port_range_array *tnl_port_range_arr;
-    if (strlen(intercept_v1_config) > 0) {
+    if (intercept_v1_config != NULL) {
         ZITI_LOG(TRACE, "intercept.v1: %s", intercept_v1_config);
         ziti_intercept_cfg_v1 cfg_v1;
         parse_ziti_intercept_cfg_v1(&cfg_v1, intercept_v1_config, strlen(intercept_v1_config));
 
         // set address
-        tnl_addr_arr = calloc(sizeof(cfg_v1.addresses), sizeof(struct tunnel_address_s));
+        tnl_svc->Addresses = calloc(sizeof(cfg_v1.addresses) + 1, sizeof(struct tunnel_address_s));
         int address_idx;
         for(address_idx=0; cfg_v1.addresses[address_idx]; address_idx++) {
             char* addr = cfg_v1.addresses[address_idx];
-            tnl_addr_arr[address_idx] = to_address(addr);
+            tnl_svc->Addresses[address_idx] = to_address(addr);
         }
 
         // set protocols
-        protocols = cfg_v1.protocols;
+        tnl_svc->Protocols = calloc(sizeof(cfg_v1.protocols) +1, sizeof(char*));
+        int proto_idx;
+        for (proto_idx = 0; cfg_v1.protocols[proto_idx]; proto_idx++) {
+            tnl_svc->Protocols[proto_idx++] = cfg_v1.protocols[proto_idx];
+        }
 
         // set ports
-        tnl_port_range_arr = calloc(sizeof(cfg_v1.port_ranges), sizeof(struct tunnel_port_range_s));
+        tnl_svc->Ports = calloc(sizeof(cfg_v1.port_ranges) + 1, sizeof(struct tunnel_port_range_s));
         int port_idx;
         for(port_idx=0; cfg_v1.port_ranges[port_idx]; port_idx++) {
-            tnl_port_range_arr[port_idx] = getTunnelPortRange(cfg_v1.port_ranges[port_idx]);
+            tnl_svc->Ports[port_idx] = getTunnelPortRange(cfg_v1.port_ranges[port_idx]);
         }
     } else {
         const char* zt_client_v1_config = ziti_service_get_raw_config(service, CFG_ZITI_TUNNELER_CLIENT_V1);
@@ -241,33 +294,45 @@ static void setTunnelServiceAddress(tunnel_service *tnl_svc, ziti_service *servi
         parse_ziti_client_cfg_v1(&zt_client_cfg_v1, zt_client_v1_config, strlen(zt_client_v1_config));
 
         // set tunnel address
-        tnl_addr_arr = calloc(1, sizeof(struct tunnel_address_s));
-        tnl_addr_arr[0] = to_address(zt_client_cfg_v1.hostname);
+        tnl_svc->Addresses = calloc(2, sizeof(struct tunnel_address_s));
+        tnl_svc->Addresses[0] = to_address(zt_client_cfg_v1.hostname);
 
         // set protocols
-        protocols = calloc(2, sizeof(char*));
+        tnl_svc->Protocols = calloc(3, sizeof(char*));
         int idx=0;
-        protocols[idx++] = strdup("TCP");
-        protocols[idx] = strdup("UDP");
+        tnl_svc->Protocols[idx] = calloc(3, sizeof(char));
+        tnl_svc->Protocols[idx] = strdup("TCP");
+        idx++;
+        tnl_svc->Protocols[idx] = calloc(3, sizeof(char));
+        tnl_svc->Protocols[idx] = strdup("UDP");
 
         // set port range
         // set ports
-        tnl_port_range_arr = calloc(1, sizeof(struct tunnel_port_range_s));
+        tnl_svc->Ports = calloc(2, sizeof(struct tunnel_port_range_s));
         tunnel_port_range *tpr = calloc(1, sizeof(struct tunnel_port_range_s));
         tpr->Low = zt_client_cfg_v1.port;
         tpr->High = zt_client_cfg_v1.port;
-        tnl_port_range_arr[0] = tpr;
-    }
-    if (tnl_addr_arr != NULL) {
-        tnl_svc->Addresses = tnl_addr_arr;
-        tnl_svc->Ports = tnl_port_range_arr;
+        tnl_svc->Ports[0] = tpr;
     }
 
-    tnl_svc->Protocols = protocols;
+}
+
+tunnel_service *find_tunnel_service(tunnel_identity* id, char* svc_id) {
+    int idx = 0;
+    tunnel_service *svc = NULL;
+    if (id->Services != NULL) {
+        for (idx =0; id->Services[idx]; idx++) {
+            svc = id->Services[idx];
+            if (strcmp(svc->Id, svc_id) == 0) {
+                break;
+            }
+        }
+    }
+    return svc;
 }
 
 tunnel_service *get_tunnel_service(tunnel_identity* id, ziti_service* zs) {
-    struct tunnel_service_s *svc = malloc(sizeof(struct tunnel_service_s));
+    struct tunnel_service_s *svc = calloc(1, sizeof(struct tunnel_service_s));
     svc->Id = strdup(zs->id);
     svc->Name = strdup(zs->name);
     svc->PostureChecks = NULL;
@@ -277,11 +342,130 @@ tunnel_service *get_tunnel_service(tunnel_identity* id, ziti_service* zs) {
     return svc;
 }
 
+tunnel_identity_array get_tunnel_identities() {
+    struct tnl_identity_s *tnl_id;
+    int idx = 0;
+    LIST_FOREACH(tnl_id, &tnl_identity_list, _next) {
+        idx++;
+    }
+
+    if (idx > 0) {
+        tunnel_identity_array *tnl_id_arr = calloc(idx, sizeof(struct tunnel_identity_s));
+
+        idx = 0;
+        LIST_FOREACH(tnl_id, &tnl_identity_list, _next) {
+            tnl_id_arr[idx] = tnl_id->id;
+        }
+
+        return tnl_id_arr;
+    } else {
+        return NULL;
+    }
+
+}
+
+int get_remaining_timeout(int timeout, int timeout_rem, tunnel_identity *tnl_id) {
+
+    if (timeout <= 0 || timeout_rem <= 0 || tnl_id->MfaLastUpdatedTime == NULL || tnl_id->ServiceUpdatedTime == NULL) {
+        return timeout_rem;
+    }
+
+    int timeout_remaining = 0;
+    uv_timeval64_t now;
+    uv_gettimeofday(&now);
+
+    // calculate effective timeout remaining from last mfa or service update time
+    if (tnl_id->MfaLastUpdatedTime->tv_sec > tnl_id->ServiceUpdatedTime->tv_sec) {
+        //calculate svc remaining timeout
+        int elapsed_time = now.tv_sec - tnl_id->MfaLastUpdatedTime->tv_sec;
+        if ((timeout - elapsed_time) < 0) {
+            timeout_remaining = 0;
+        } else {
+            timeout_remaining = timeout - elapsed_time;
+        }
+    } else {
+        //calculate svc remaining timeout
+        int elapsed_time = now.tv_sec - tnl_id->ServiceUpdatedTime->tv_sec;
+        if ((timeout_rem - elapsed_time) < 0) {
+            timeout_remaining = 0;
+        } else {
+            timeout_remaining = timeout_rem - elapsed_time;
+        }
+    }
+    return timeout_remaining;
+}
+
+void set_mfa_timeout_rem(tunnel_identity *tnl_id) {
+
+    if ((tnl_id->MfaMinTimeoutRem > -1 || tnl_id->MfaMaxTimeoutRem > -1) && tnl_id->Services != NULL ) {
+        for (int svc_idx = 0 ; tnl_id->Services[svc_idx]; svc_idx++ ) {
+            tunnel_service *tnl_svc = tnl_id->Services[svc_idx];
+            int svc_timeout = -1;
+            int svc_timeout_rem = -1;
+            if (tnl_svc->TimeoutRemaining > -1 && tnl_svc->PostureChecks != NULL ) {
+                // fetch service timeout and timeout remaining from the posture checks
+                for (int pc_idx = 0; tnl_svc->PostureChecks[pc_idx]; pc_idx++) {
+                    tunnel_posture_check *pc = tnl_svc->PostureChecks[pc_idx];
+                    if (svc_timeout == -1 || svc_timeout > pc->Timeout) {
+                        svc_timeout = pc->Timeout;
+                    }
+                    if (svc_timeout_rem == -1 || svc_timeout_rem > pc->TimeoutRemaining) {
+                        svc_timeout_rem = pc->TimeoutRemaining;
+                    }
+                }
+
+                tnl_svc->TimeoutRemaining = get_remaining_timeout(svc_timeout, svc_timeout_rem, tnl_id);
+            }
+        }
+
+        if (tnl_id->MfaMinTimeoutRem > -1) {
+            tnl_id->MfaMinTimeoutRem = get_remaining_timeout(tnl_id->MfaMinTimeout, tnl_id->MinTimeoutRemInSvcEvent, tnl_id);
+        }
+        if (tnl_id->MfaMaxTimeoutRem > -1) {
+            tnl_id->MfaMaxTimeoutRem = get_remaining_timeout(tnl_id->MfaMaxTimeout, tnl_id->MaxTimeoutRemInSvcEvent, tnl_id);
+        }
+        if (tnl_id->MfaMaxTimeoutRem == 0 && tnl_id->MfaEnabled ) {
+            tnl_id->MfaNeeded = true;
+        }
+    }
+
+}
+
+tunnel_status *get_tunnel_status() {
+    if (tnl_status == NULL) {
+        tnl_status = calloc(1, sizeof(struct tunnel_status_s));
+        tnl_status->Active = false;
+        tnl_status->Duration = 0;
+        uv_timeval64_t now;
+        uv_gettimeofday(&now);
+        tnl_status->StartTime.tv_sec = now.tv_sec;
+        tnl_status->StartTime.tv_usec = now.tv_usec;
+    } else {
+        uv_timeval64_t now;
+        uv_gettimeofday(&now);
+        uint64_t start_time_in_millis = (tnl_status->StartTime.tv_sec * (uint64_t)1000) + (tnl_status->StartTime.tv_usec / 1000);
+        uint64_t current_time_in_millis = (now.tv_sec * (uint64_t)1000) + (now.tv_usec / 1000);
+        tnl_status->Duration = current_time_in_millis - start_time_in_millis;
+    }
+
+    tnl_status->Identities = get_tunnel_identities();
+
+    if (tnl_status->Identities != NULL) {
+        for (int id_idx = 0; tnl_status->Identities[id_idx] != 0; id_idx++) {
+            set_mfa_timeout_rem(tnl_status->Identities[id_idx]);
+            tnl_status->Identities[id_idx]->Notified = false;
+        }
+    }
+
+    return tnl_status;
+}
+
 void set_mfa_status(char* identifier, bool mfa_enabled, bool mfa_needed) {
     tunnel_identity *tnl_id = find_tunnel_identity(identifier);
     if (tnl_id != NULL) {
         tnl_id->MfaEnabled = mfa_enabled;
         tnl_id->MfaNeeded = mfa_needed;
+        tnl_id->Notified = false;
         ZITI_LOG(DEBUG, "ztx[%s] mfa enabled : %d, mfa needed : %d ", identifier, mfa_enabled, mfa_needed);
     }
 }
@@ -308,4 +492,5 @@ IMPL_MODEL(tunnel_address, TUNNEL_ADDRESS)
 IMPL_MODEL(tunnel_port_range, TUNNEL_PORT_RANGE)
 IMPL_MODEL(tunnel_posture_check, TUNNEL_POSTURE_CHECK)
 IMPL_MODEL(tunnel_service, TUNNEL_SERVICE)
+IMPL_MODEL(tunnel_status, TUNNEL_STATUS)
 
